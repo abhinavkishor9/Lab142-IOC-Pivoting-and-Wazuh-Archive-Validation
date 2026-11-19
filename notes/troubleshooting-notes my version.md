@@ -1,265 +1,272 @@
 # Troubleshooting Notes
-## 1. Python Virtual Environment Preparation
+
+## 1. Initial File Creation Event Not Found
 
 ### Issue
 
-The initial Python environment did not have the required virtual-environment support installed.
+The controlled file was created at:
+
+`C:\Lab142\ioc-test.txt`
+
+However, the PowerShell query for Sysmon Event ID 11 returned no matching event.
+
+### Diagnostic Query
+
+```powershell
+Get-WinEvent -FilterHashtable @{
+    LogName = 'Microsoft-Windows-Sysmon/Operational'
+    Id = 11
+    StartTime = (Get-Date).AddMinutes(-30)
+} -ErrorAction SilentlyContinue |
+Where-Object {
+    $_.Message -match 'C:\\Lab142\\ioc-test.txt'
+} |
+Select-Object TimeCreated, Id, Message
+```
+
+### Observation
+
+The query returned no matching records.
+
+The file's existence, properties, and SHA256 were independently confirmed.
+
+### Follow-up
+
+A separate controlled file creation under the Downloads directory produced a matching Sysmon Event ID 11.
+
+The exact reason the initial path did not return a matching event was not established.
+
+---
+
+## 2. Wazuh Archive Index Not Available in Discover
+
+### Issue
+
+The Discover interface initially displayed only:
+
+`wazuh-alerts-*`
+
+The archive index was not available for selection.
+
+### Investigation
+
+The Wazuh manager's JSON archive was inspected and contained the controlled Sysmon event.
+
+Filebeat configuration initially showed:
+
+```yaml
+archives:
+  enabled: false
+```
 
 ### Resolution
 
-Installed the required Ubuntu package:
+Archive collection was enabled:
 
-```bash
-sudo apt update
-sudo apt install python3.12-venv
+```yaml
+archives:
+  enabled: true
 ```
 
-Created and activated the virtual environment:
+A backup of the original Filebeat configuration was created before editing.
 
-```bash
-python3 -m venv ~/volatility3-venv
-source ~/volatility3-venv/bin/activate
-```
+The Filebeat configuration was validated successfully, and the service was restarted.
 
 ### Verification
 
-```bash
-python3 --version
-vol -h
-```
+Filebeat logs confirmed:
 
-Observed:
+- Wazuh archive fileset enabled.
+- Archive JSON path configured.
+- Archive harvester started.
+- Elasticsearch connection established.
+- Wazuh archive pipeline loaded.
 
-- Python 3.12.3
-- Volatility 3 Framework 2.28.2
+The archive index subsequently existed in Elasticsearch.
 
-The virtual environment was used for the investigation.
+---
 
-## 2. Incorrect Source Path Execution
+## 3. Elasticsearch Authentication
 
 ### Issue
 
-The directory path was initially entered directly as a shell command:
-
-```bash
-/mnt/d/important docs/Cybersecurity labs and resources/Win11Dump
-```
-
-The shell interpreted the space in `important docs` as a command separator and returned:
+An unauthenticated request to the Elasticsearch endpoint returned:
 
 ```text
--bash: /mnt/d/important: No such file or directory
+HTTP Status: 401
+```
+
+### Explanation
+
+The endpoint was reachable, but authentication was required.
+
+Filebeat's keystore contained:
+
+```text
+password
+username
 ```
 
 ### Resolution
 
-Paths containing spaces must be enclosed in quotation marks:
+The authenticated Wazuh Dashboard Dev Tools Console was used for read-only Elasticsearch queries.
 
-```bash
-ls -lh "/mnt/d/important docs/Cybersecurity labs and resources/Win11Dump"
-```
+This avoided manually entering or exposing the Elasticsearch password.
 
-This revealed the existing `Win11Dump.mem` file.
+---
 
-## 3. Expected ZIP Archive Was Missing
+## 4. Filebeat Indexing Warnings
 
 ### Issue
 
-The investigation initially expected an archive named `Win11Dump.zip`.
+Filebeat reported:
 
-The following commands were attempted:
-
-```bash
-unzip -l samples/Win11Dump.zip
-unzip -l Win11Dump.zip
+```text
+mapper_parsing_exception
 ```
 
-Both returned errors indicating that the archive could not be found.
+The affected field was:
 
-The source directory contained `Win11Dump.mem`, not the expected ZIP archive.
+`data.port.local_ip`
 
-### Resolution
+Some values contained malformed IPv6 formatting, for example:
 
-The existing `.mem` file was copied directly. No ZIP extraction was necessary.
-
-```bash
-cp "/mnt/d/important docs/Cybersecurity labs and resources/Win11Dump/Win11Dump.mem" samples/extracted/
+```text
+fe80:::283d:13b4:3a22:747f
 ```
 
-## 4. Missing Destination Operand in the Copy Command
+### Explanation
+
+Elasticsearch expected a valid IP address but could not parse the supplied value.
+
+These warnings were associated with archived Syscollector port information.
+
+### Investigation Result
+
+The warning established that certain documents were rejected during indexing.
+
+It did not prove that all archive events were rejected.
+
+### Action Taken
+
+No index mappings were changed.
+
+No indices were deleted or recreated.
+
+The exact Lab 142 Sysmon event was searched independently.
+
+### Result
+
+The controlled Sysmon event was found successfully in the archive index.
+
+---
+
+## 5. Archive Index Verification
+
+### Query
+
+```http
+GET _cat/indices/wazuh-archives-*?v
+```
+
+### Result
+
+The following index was available:
+
+`wazuh-archives-4.x-2026.11.19`
+
+Observed properties:
+
+- Health: green
+- Status: open
+- Documents: 15,762
+- Storage: 24.9 MB
+
+This confirmed that the archive index was available and contained indexed documents.
+
+---
+
+## 6. Exact Sysmon Event Search
+
+### Query
+
+```http
+GET wazuh-archives-4.x-2026.11.19/_search
+{
+  "size": 5,
+  "query": {
+    "wildcard": {
+      "data.win.eventdata.targetFilename": {
+        "value": "*ioc-test.txt*"
+      }
+    }
+  }
+}
+```
+
+### Result
+
+One matching document was returned.
+
+The result contained:
+
+- Agent ID: 001
+- Host: DESKTOP-9MMM37V
+- Event ID: 11
+- File: `C:\Users\Dell\Downloads\Lab142\ioc-test.txt`
+- Timestamp: `2026-11-19T14:54:05.371+0530`
+
+This confirmed successful indexing of the exact event.
+
+---
+
+## 7. Discover Does Not Display Archive Events
 
 ### Issue
 
-The following command was incomplete:
+Discover displayed only:
 
-```bash
-cp "/mnt/d/important docs/Cybersecurity labs and resources/Win11Dump/Win11Dump.mem"
-```
+`wazuh-alerts-*`
 
-The `cp` command requires both a source and a destination.
+The archive index was already present in Elasticsearch.
 
-### Resolution
+### Root Cause Identified
 
-Used:
+The archive index pattern had not yet been created in the Dashboard.
 
-```bash
-cp "/mnt/d/important docs/Cybersecurity labs and resources/Win11Dump/Win11Dump.mem" samples/extracted/
-```
-
-Verified the copy:
-
-```bash
-ls -lh samples/extracted/
-```
-
-The copied file was approximately 3.5 GB.
-
-## 5. File Format Identification
-
-### Observation
-
-The following command was used:
-
-```bash
-file samples/extracted/Win11Dump.mem
-```
-
-Observed output:
+### Navigation Identified
 
 ```text
-samples/extracted/Win11Dump.mem: Windows Event Trace Log
+Dashboards Management
+    └── Index patterns
 ```
 
-The same identification was returned for the source file.
+### Pending Resolution
 
-### Investigation significance
-
-The `.mem` extension does not establish that a file is a valid physical-memory acquisition.
-
-The `Windows Event Trace Log` identification creates an important format-validation question.
-
-Although Volatility produced output from several Windows plugins, this alone does not resolve the discrepancy.
-
-### Recommended validation
-
-Before treating the sample as a verified RAM capture:
-
-- Obtain the original sample's documentation and acquisition details.
-- Run `windows.info` and preserve the complete output.
-- Review Volatility's image-layer and operating-system identification.
-- Confirm that the sample format is supported and that the results are consistent with its provenance.
-
-Do not rename the file or change its extension as a substitute for format validation.
-
-## 6. Volatility Placeholder Filename Error
-
-### Issue
-
-A command was initially executed using a placeholder:
-
-```bash
-vol -f "samples/extracted/<memory-image-filename>" windows.pslist > output/pslist.txt
-```
-
-Volatility returned:
+Create the following index pattern:
 
 ```text
-vol: error: File does not exist: /home/abhinav/malware-yara-labs/lab29/samples/extracted/<memory-image-filename>
+wazuh-archives-*
 ```
 
-The shell passed the placeholder literally. It was not automatically replaced with the actual filename.
-
-### Resolution
-
-Used the actual filename:
-
-```bash
-vol -f "samples/extracted/Win11Dump.mem" windows.pslist > output/pslist.txt
-```
-
-The same correction was required for the `windows.psscan` command.
-
-## 7. Volatility Plugin Output Redirection
-
-### Observation
-
-The analysis commands redirected output into files under `output/`.
-
-Example:
-
-```bash
-vol -f "samples/extracted/Win11Dump.mem" windows.pslist > output/pslist.txt
-```
-
-The command returned to the shell prompt without displaying the plugin results because standard output was redirected.
-
-### Verification
-
-The output can be reviewed using:
-
-```bash
-cat output/pslist.txt
-```
-
-For future plugin executions, redirect standard error as well:
-
-```bash
-vol -f "samples/extracted/Win11Dump.mem" windows.pslist > output/pslist.txt 2>&1
-```
-
-This helps preserve diagnostic messages alongside plugin output.
-
-## 8. Malfind Deprecation Warnings
-
-### Observation
-
-Running `windows.malfind` produced `FutureWarning` messages referring to the older plugin path:
+Select:
 
 ```text
-volatility3.plugins.windows.malware.malfind.Malfind
+timestamp
 ```
 
-The warning indicated that the plugin had been renamed to:
+as the time field.
 
-```text
-volatility3.plugins.windows.malfind.Malfind
-```
+After creation:
 
-### Interpretation
+1. Return to Discover.
+2. Select `wazuh-archives-*`.
+3. Set a time range covering November 19, 2026, around 14:54 IST.
+4. Search for `ioc-test.txt`.
 
-These were deprecation warnings, not evidence that the analysis failed.
+### Current Status
 
-The command returned to the shell prompt and the supplied output contained memory-region findings.
+The exact event is already verified in Elasticsearch. Dashboard index-pattern creation remains pending.
 
-The warning indicates a change in the plugin's internal path. It does not establish an issue with the memory sample.
-
-## 9. Evidence Integrity Verification
-
-### Commands
-
-Source hash:
-
-```bash
-sha256sum "/mnt/d/important docs/Cybersecurity labs and resources/Win11Dump/Win11Dump.mem"
-```
-
-Copied sample hash:
-
-```bash
-sha256sum samples/extracted/Win11Dump.mem | tee evidence/sample-hash.txt
-```
-
-### Observed result
-
-Both files produced:
-
-```text
-0f00815b8f78f30a63d742c73152474b2a3c35183dbb1d92c8fc6a81fa3de9f1
-```
-
-### Interpretation
-
-The matching hashes confirm that the copied file matched the source file at the time of verification.
-
-This verifies copy integrity, not the original sample's format, acquisition history, or forensic authenticity.
+---
 
